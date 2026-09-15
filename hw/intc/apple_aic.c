@@ -23,6 +23,7 @@
 #include "hw/intc/apple_aic.h"
 #include "hw/irq.h"
 #include "hw/pci/msi.h"
+#include "hw/qdev-properties.h"
 #include "qemu/bitops.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -48,10 +49,25 @@
  * num IRQ + (Y * 2) + 1 -> other_ipi (cpuX->cpuY)
  */
 
-// TODO: this is hardcoded for T8030
-#define AIC_INT_COUNT (576)
-#define AIC_CPU_COUNT (6)
-#define AIC_VERSION   (2)
+/*
+ * The limits below come from the register map itself, not from any one SoC.
+ * The counts this AIC actually has are taken from the device tree in
+ * apple_aic_create() and kept in numIRQ/numEIR/numCPU; these constants only
+ * bound the switch case ranges further down, which have to be compile-time
+ * constants, and are what apple_aic_create() validates the device tree
+ * against.
+ *
+ * REG_AIC_EIR_DEST spans 0x3000..0x4000 with one 32-bit word per interrupt,
+ * so 1024 interrupts, which is also the width of the field extracted by
+ * AIC_INT_EXTID(). Each EIR register covers 32 interrupts, so 32 EIRs.
+ * The per-CPU register aliases span 0x5000..0x6000 in 0x80 steps, so 32 CPUs,
+ * which is also the width of the per-CPU bitmaps in AppleAICCPU.
+ */
+#define AIC_MAX_INT_COUNT (1024)
+#define AIC_MAX_EIR_COUNT (AIC_MAX_INT_COUNT / 32)
+#define AIC_MAX_CPU_COUNT (32)
+
+#define AIC_VERSION_DEFAULT (2)
 
 #define REG_AIC_REV  (0x0000)
 #define REG_AIC_CAP0 (0x0004)
@@ -153,14 +169,16 @@
 #define AIC_SRC_TO_MASK(_s)    (1 << ((_s) & 0x1F))
 #define AIC_EIR_TO_SRC(_s, _v) (((_s) << 5) + ((_v) & 0x1F))
 
-#define kAIC_MAX_EXTID       (AIC_INT_COUNT)
-#define kAIC_VEC_IPI(_c, _k) (kAIC_MAX_EXTID + ((_c) * 2) + (_k))
-#define kAIC_VEC_IPI_SELF    (0)
-#define kAIC_VEC_IPI_NORMAL  (1)
-#define kAIC_NUM_IPIS(_n)    ((_n) * 2)
-#define kAIC_NUM_INTS(_n)    (kAIC_MAX_EXTID + kAIC_NUM_IPIS(_n))
-
-#define kAIC_NUM_EIRS AIC_SRC_TO_EIR(kAIC_MAX_EXTID)
+/*
+ * AIC IPI vectors sit right after the external interrupt vectors, so they
+ * depend on how many interrupts this AIC was created with rather than on a
+ * fixed constant.
+ */
+#define kAIC_VEC_IPI(_num_irq, _c, _k) ((_num_irq) + ((_c) * 2) + (_k))
+#define kAIC_VEC_IPI_SELF              (0)
+#define kAIC_VEC_IPI_NORMAL            (1)
+#define kAIC_NUM_IPIS(_n)              ((_n) * 2)
+#define kAIC_NUM_INTS(_num_irq, _n)    ((_num_irq) + kAIC_NUM_IPIS(_n))
 
 #define AIC_GLBCFG_WT_64MICRO_US (64)
 
@@ -354,6 +372,29 @@ static void apple_aic_reset_state(AppleAICState* s)
 
 static void apple_aic_reset_enter(Object* obj, ResetType type) { apple_aic_reset_state(APPLE_AIC(obj)); }
 
+/*
+ * Reached both from the default case and from a register that exists in the
+ * address map but is out of range for this AIC's configured interrupt/CPU
+ * counts. Keeping the two on the same path means widening the case ranges
+ * below to the architectural maximum cannot swallow the aliased timebase
+ * registers, whose offset depends on the device tree.
+ */
+static void apple_aic_write_unhandled(AppleAICCPU* o, hwaddr addr, uint32_t val)
+{ qemu_log_mask(LOG_UNIMP, "AIC: Write to unsupported reg 0x" HWADDR_FMT_plx " cpu %u: 0x%x\n", addr, o->cpu_id, val); }
+
+static uint64_t apple_aic_read_unhandled(AppleAICCPU* o, hwaddr addr)
+{
+    AppleAICState* s = o->aic;
+
+    if (addr == s->time_base + 0x20) { return apple_aic_emulate_timer() & 0xFFFFFFFF; }
+    else if (addr == s->time_base + 0x28) {
+        return (apple_aic_emulate_timer() >> 32) & 0xFFFFFFFF;
+    }
+
+    qemu_log_mask(LOG_UNIMP, "AIC: Read from unsupported reg 0x" HWADDR_FMT_plx " cpu: %u\n", addr, o->cpu_id);
+    return -1;
+}
+
 static void apple_aic_write(void* opaque, hwaddr addr, uint64_t data, unsigned size)
 {
     AppleAICCPU*   o   = opaque;
@@ -440,51 +481,66 @@ static void apple_aic_write(void* opaque, hwaddr addr, uint64_t data, unsigned s
             if (val & AIC_IPI_SELF) { qatomic_and(&o->deferredIPI, ~AIC_IPI_SELF); }
             break;
         }
-        case REG_AIC_EIR_DEST(0)... REG_AIC_EIR_DEST(AIC_INT_COUNT): {
+        case REG_AIC_EIR_DEST(0)... REG_AIC_EIR_DEST(AIC_MAX_INT_COUNT) - 4: {
             uint32_t vector = (addr - REG_AIC_EIR_DEST(0)) / 4;
-            if (unlikely(vector >= s->numIRQ)) { break; }
+            if (unlikely(vector >= s->numIRQ)) {
+                apple_aic_write_unhandled(o, addr, val);
+                break;
+            }
             qatomic_set(&s->eir_dest[vector], val);
             break;
         }
-        case REG_AIC_EIR_SW_SET(0)... REG_AIC_EIR_SW_SET(kAIC_NUM_EIRS): {
+        case REG_AIC_EIR_SW_SET(0)... REG_AIC_EIR_SW_SET(AIC_MAX_EIR_COUNT) - 4: {
             uint32_t eir = (addr - REG_AIC_EIR_SW_SET(0)) / 4;
-            if (unlikely(eir >= s->numEIR)) { break; }
+            if (unlikely(eir >= s->numEIR)) {
+                apple_aic_write_unhandled(o, addr, val);
+                break;
+            }
             qatomic_or(&s->eir_state[eir], val);
             apple_aic_deliver(s);
             break;
         }
-        case REG_AIC_EIR_SW_CLR(0)... REG_AIC_EIR_SW_CLR(kAIC_NUM_EIRS): {
+        case REG_AIC_EIR_SW_CLR(0)... REG_AIC_EIR_SW_CLR(AIC_MAX_EIR_COUNT) - 4: {
             uint32_t eir = (addr - REG_AIC_EIR_SW_CLR(0)) / 4;
-            if (unlikely(eir >= s->numEIR)) { break; }
+            if (unlikely(eir >= s->numEIR)) {
+                apple_aic_write_unhandled(o, addr, val);
+                break;
+            }
             qatomic_and(&s->eir_state[eir], ~val);
             break;
         }
-        case REG_AIC_EIR_MASK_SET(0)... REG_AIC_EIR_MASK_SET(kAIC_NUM_EIRS): {
+        case REG_AIC_EIR_MASK_SET(0)... REG_AIC_EIR_MASK_SET(AIC_MAX_EIR_COUNT) - 4: {
             uint32_t eir = (addr - REG_AIC_EIR_MASK_SET(0)) / 4;
-            if (unlikely(eir >= s->numEIR)) { break; }
+            if (unlikely(eir >= s->numEIR)) {
+                apple_aic_write_unhandled(o, addr, val);
+                break;
+            }
             qatomic_or(&s->eir_mask[eir], val);
             break;
         }
-        case REG_AIC_EIR_MASK_CLR(0)... REG_AIC_EIR_MASK_CLR(kAIC_NUM_EIRS): {
+        case REG_AIC_EIR_MASK_CLR(0)... REG_AIC_EIR_MASK_CLR(AIC_MAX_EIR_COUNT) - 4: {
             uint32_t eir = (addr - REG_AIC_EIR_MASK_CLR(0)) / 4;
 
-            if (unlikely(eir >= s->numEIR)) { break; }
+            if (unlikely(eir >= s->numEIR)) {
+                apple_aic_write_unhandled(o, addr, val);
+                break;
+            }
 
             qatomic_and(&s->eir_mask[eir], ~val);
             apple_aic_deliver(s);
             break;
         }
-        case REG_AIC_WHOAMI_Pn(0)... REG_AIC_WHOAMI_Pn(AIC_CPU_COUNT) - 4: {
+        case REG_AIC_WHOAMI_Pn(0)... REG_AIC_WHOAMI_Pn(AIC_MAX_CPU_COUNT) - 4: {
             uint32_t cpu = ((addr - 0x5000) / 0x80);
-            if (unlikely(cpu >= s->numCPU)) { break; }
+            if (unlikely(cpu >= s->numCPU)) {
+                apple_aic_write_unhandled(o, addr, val);
+                break;
+            }
             addr = addr - 0x5000 + 0x2000 - 0x80 * cpu;
             apple_aic_write(&s->cpus[cpu], addr, data, size);
             break;
         }
-        default:
-            qemu_log_mask(LOG_UNIMP, "AIC: Write to unsupported reg 0x" HWADDR_FMT_plx " cpu %u: 0x%x\n", addr,
-                          o->cpu_id, val);
-            break;
+        default: apple_aic_write_unhandled(o, addr, val); break;
     }
 }
 
@@ -494,7 +550,7 @@ static uint64_t apple_aic_read(void* opaque, hwaddr addr, unsigned size)
     AppleAICState* s = o->aic;
 
     switch (addr) {
-        case REG_AIC_REV          : return AIC_VERSION;
+        case REG_AIC_REV          : return s->version;
         case REG_AIC_CAP0         : return (((uint64_t)s->numCPU - 1) << 16) | (s->numIRQ);
         case REG_AIC_GLB_CFG      : return qatomic_read(&s->global_cfg);
         case REG_AIC_PVT_STAMP_CFG: return qatomic_read(&s->pvt_stamp_cfg);
@@ -553,53 +609,44 @@ static uint64_t apple_aic_read(void* opaque, hwaddr addr, unsigned size)
             }
             return kAIC_INT_SPURIOUS;
         }
-        case REG_AIC_IPI_MASK_SET                                  :
-        case REG_AIC_IPI_MASK_CLR                                  : return qatomic_read(&o->ipi_mask);
-        case REG_AIC_EIR_DEST(0)... REG_AIC_EIR_DEST(AIC_INT_COUNT): {
+        case REG_AIC_IPI_MASK_SET                                          :
+        case REG_AIC_IPI_MASK_CLR                                          : return qatomic_read(&o->ipi_mask);
+        case REG_AIC_EIR_DEST(0)... REG_AIC_EIR_DEST(AIC_MAX_INT_COUNT) - 4: {
             uint32_t vector = (addr - REG_AIC_EIR_DEST(0)) / 4;
 
-            if (unlikely(vector >= s->numIRQ)) { break; }
+            if (unlikely(vector >= s->numIRQ)) { return apple_aic_read_unhandled(o, addr); }
 
             return qatomic_read(&s->eir_dest[vector]);
         }
-        case REG_AIC_EIR_MASK_SET(0)... REG_AIC_EIR_MASK_SET(kAIC_NUM_EIRS): {
+        case REG_AIC_EIR_MASK_SET(0)... REG_AIC_EIR_MASK_SET(AIC_MAX_EIR_COUNT) - 4: {
             uint32_t eir = (addr - REG_AIC_EIR_MASK_SET(0)) / 4;
 
-            if (unlikely(eir >= s->numEIR)) { break; }
+            if (unlikely(eir >= s->numEIR)) { return apple_aic_read_unhandled(o, addr); }
 
             return qatomic_read(&s->eir_mask[eir]);
         }
-        case REG_AIC_EIR_MASK_CLR(0)... REG_AIC_EIR_MASK_CLR(kAIC_NUM_EIRS): {
+        case REG_AIC_EIR_MASK_CLR(0)... REG_AIC_EIR_MASK_CLR(AIC_MAX_EIR_COUNT) - 4: {
             uint32_t eir = (addr - REG_AIC_EIR_MASK_CLR(0)) / 4;
 
-            if (unlikely(eir >= s->numEIR)) { break; }
+            if (unlikely(eir >= s->numEIR)) { return apple_aic_read_unhandled(o, addr); }
 
             return qatomic_read(&s->eir_mask[eir]);
         }
-        case REG_AIC_EIR_INT_RO(0)... REG_AIC_EIR_INT_RO(kAIC_NUM_EIRS): {
+        case REG_AIC_EIR_INT_RO(0)... REG_AIC_EIR_INT_RO(AIC_MAX_EIR_COUNT) - 4: {
             uint32_t eir = (addr - REG_AIC_EIR_INT_RO(0)) / 4;
 
-            if (unlikely(eir >= s->numEIR)) { break; }
+            if (unlikely(eir >= s->numEIR)) { return apple_aic_read_unhandled(o, addr); }
             return qatomic_read(&s->eir_state[eir]);
         }
-        case REG_AIC_WHOAMI_Pn(0)... REG_AIC_WHOAMI_Pn(AIC_CPU_COUNT) - 4: {
+        case REG_AIC_WHOAMI_Pn(0)... REG_AIC_WHOAMI_Pn(AIC_MAX_CPU_COUNT) - 4: {
             uint32_t cpu = ((addr - 0x5000) / 0x80);
 
-            if (unlikely(cpu >= s->numCPU)) { break; }
+            if (unlikely(cpu >= s->numCPU)) { return apple_aic_read_unhandled(o, addr); }
 
             addr = addr - 0x5000 + 0x2000 - 0x80 * cpu;
             return apple_aic_read(&s->cpus[cpu], addr, size);
         }
-        default:
-            if (addr == s->time_base + 0x20) { return apple_aic_emulate_timer() & 0xFFFFFFFF; }
-            else if (addr == s->time_base + 0x28) {
-                return (apple_aic_emulate_timer() >> 32) & 0xFFFFFFFF;
-            }
-            else {
-                qemu_log_mask(LOG_UNIMP, "AIC: Read from unsupported reg 0x" HWADDR_FMT_plx " cpu: %u\n", addr,
-                              o->cpu_id);
-            }
-            break;
+        default: return apple_aic_read_unhandled(o, addr);
     }
     return -1;
 }
@@ -621,6 +668,8 @@ static void apple_aic_realize(DeviceState* dev, struct Error** errp)
     SysBusDevice*  sbd = SYS_BUS_DEVICE(dev);
     int            i;
 
+    assert_cmpuint(s->numCPU, !=, 0);
+
     s->cpus = g_new0(AppleAICCPU, s->numCPU);
 
     for (i = 0; i < s->numCPU; i++) {
@@ -636,8 +685,6 @@ static void apple_aic_realize(DeviceState* dev, struct Error** errp)
     }
 
     qdev_init_gpio_in(dev, apple_aic_set_irq, s->numIRQ);
-
-    assert_cmpuint(s->numCPU, !=, 0);
 
     s->eir_mask  = g_new0(uint32_t, s->numEIR);
     s->eir_dest  = g_new0(uint32_t, s->numIRQ);
@@ -684,6 +731,18 @@ SysBusDevice* apple_aic_create(uint32_t numCPU, AppleDTNode* node, AppleDTNode* 
     s->numIRQ = s->numEIR * 32;
     s->numCPU = numCPU;
 
+    if (s->numEIR == 0 || s->numEIR > AIC_MAX_EIR_COUNT) {
+        error_setg(&error_fatal, "AIC: device tree asks for %u interrupts, but the register map addresses at most %u",
+                   s->numIRQ, AIC_MAX_INT_COUNT);
+        return NULL;
+    }
+
+    if (numCPU == 0 || numCPU > AIC_MAX_CPU_COUNT) {
+        error_setg(&error_fatal, "AIC: %u CPUs requested, but the register map addresses at most %u", numCPU,
+                   AIC_MAX_CPU_COUNT);
+        return NULL;
+    }
+
     s->time_base =
         apple_dt_get_prop_u64(timebase_node, "reg", &error_warn) - apple_dt_get_prop_u64(node, "reg", &error_warn);
 
@@ -692,6 +751,14 @@ SysBusDevice* apple_aic_create(uint32_t numCPU, AppleDTNode* node, AppleDTNode* 
 
     return SYS_BUS_DEVICE(dev);
 }
+
+static const Property apple_aic_props[] = {
+    /*
+     * Reported through REG_AIC_REV. Machines whose AIC predates the revision
+     * T8030 reports can override it.
+     */
+    DEFINE_PROP_UINT32("version", AppleAICState, version, AIC_VERSION_DEFAULT),
+};
 
 static void apple_aic_class_init(ObjectClass* klass, const void* data)
 {
@@ -703,6 +770,7 @@ static void apple_aic_class_init(ObjectClass* klass, const void* data)
     dc->realize   = apple_aic_realize;
     dc->unrealize = apple_aic_unrealize;
     dc->desc      = "Apple Interrupt Controller";
+    device_class_set_props(dc, apple_aic_props);
 }
 
 static const TypeInfo apple_aic_info = {

@@ -51,6 +51,7 @@ struct AppleAICState
     QEMUTimer*   timer;
     uint32_t     phandle;
     uint32_t     base_size;
+    uint32_t     version;
     uint32_t     numEIR;
     uint32_t     numIRQ;
     uint32_t     numCPU;

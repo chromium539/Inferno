@@ -6,6 +6,10 @@ are worth closing.
 
 All references are `path:line` against the tree at the time of writing.
 
+> **This document is AI-generated**, as is some of the code it describes. See the
+> warning at the top of the README. Nothing here has been validated by booting
+> firmware.
+
 ---
 
 ## 1. Scope
@@ -264,8 +268,13 @@ third machine (T8010/T8015/T8020 are all referenced in passing —
 `hw/pci-host/apcie.c:1583`, `hw/arm/sep/debug-trace.c:193`,
 `hw/block/nvme_mmu.c:235`):
 
-- `AIC_INT_COUNT` / `AIC_CPU_COUNT` / `AIC_VERSION` are `#define`s with an
-  explicit `// TODO: this is hardcoded for T8030` (`hw/intc/apple_aic.c:51`).
+- ~~`AIC_INT_COUNT` / `AIC_CPU_COUNT` / `AIC_VERSION` are `#define`s with an
+  explicit `// TODO: this is hardcoded for T8030`.~~ **Done** — the switch case
+  ranges are now bounded by the limits the register map imposes
+  (`AIC_MAX_INT_COUNT` / `AIC_MAX_EIR_COUNT` / `AIC_MAX_CPU_COUNT`) rather than
+  by T8030's counts, the counts themselves were already taken from the device
+  tree, `apple_aic_create()` validates them, and the reported revision is a
+  `version` property. Compile-checked only.
 - SEP boot-monitor and debug-trace carry per-chip address tables keyed off
   `chip_id` (`hw/arm/sep/debug-trace.c:174`).
 - APCIe already branches on compatible string, which is the pattern to copy.
@@ -379,8 +388,11 @@ machine wiring plus DT whitelist entries, not new emulation.
 Unblocks any third machine, and is cheaper to do before more devices harden
 T8030 assumptions.
 
-1. Parameterise AIC (`hw/intc/apple_aic.c:51`) — interrupt count, CPU count and
-   version from the DT node rather than `#define`s.
+1. ~~Parameterise AIC — interrupt count, CPU count and version rather than
+   `#define`s.~~ **Done**, see §4.5. Note the counts were already DT-derived
+   into `numIRQ`/`numEIR`/`numCPU`; what was hardcoded were the compile-time
+   `case` ranges around them, which silently sent any access past T8030's
+   counts to the unimplemented-register path.
 2. Extend the SEP chip-id tables (`hw/arm/sep/debug-trace.c:174`) to a table
    keyed by chip id rather than an `if` ladder.
 3. Audit each `*_from_node()` for T8030-only assumptions.
