@@ -1,6 +1,32 @@
-# ChefKiss Inferno ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/ChefKissInc/Inferno/build.yaml?style=for-the-badge) ![Written by humans, not AI](https://img.shields.io/badge/written_by_humans-not_ai-blue?style=for-the-badge)
+# ChefKiss Inferno ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/ChefKissInc/Inferno/build.yaml?style=for-the-badge) ![Contains AI-generated code](https://img.shields.io/badge/contains-ai_generated_code-red?style=for-the-badge)
 
 Cross-platform Apple ARM device emulation, based on very heavily-modified QEMU code.
+
+> [!WARNING]
+> # This fork contains AI-generated code
+>
+> **This branch is not the upstream ChefKiss Inferno.** Parts of the code and
+> documentation in this fork were written by an AI assistant (Claude) rather
+> than by a human, and the "written by humans, not AI" badge that upstream
+> carries has been removed here because it is no longer accurate.
+>
+> What this means in practice:
+>
+> - **AI-generated changes here have not been validated against real hardware
+>   or real firmware.** At most they have been shown to compile. Emulation
+>   correctness for this project is decided by whether unmodified Apple
+>   firmware boots and behaves, and that has not been checked for this code.
+> - **Do not assume review happened.** Treat every AI-authored change as an
+>   untested proposal, not as working code, until a human has read it and
+>   booted it.
+> - **Do not send AI-generated changes upstream** to ChefKissInc/Inferno, or
+>   present them as upstream work, without saying plainly that they were
+>   AI-generated. Upstream has an explicit stance on this.
+> - Commits containing AI-generated work are marked with a
+>   `Co-Authored-By: Claude` trailer, so `git log` can be used to find them.
+>
+> If you want only human-written code, use upstream:
+> <https://github.com/ChefKissInc/Inferno>.
 
 > [!CAUTION]
 > Please consider donating/tipping to help continue the project's development,
